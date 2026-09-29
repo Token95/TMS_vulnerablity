@@ -64,11 +64,16 @@
     InternetFacingHostPatterns = @()   # e.g. 'vpn*', 'www*'
 
     # ---- Remediation workbooks ------------------------------------------
-    # An Excel file (.xlsx/.xlsm) whose name matches one of these patterns is
-    # treated as a filled-in Action Plan and gets its own Remediation Status
-    # report (PDF + CSV). The sheet with the CVE IDs is used. A .csv with a
-    # matching name is used only once Owner/Status/Target Date/Notes is filled in.
-    RemediationFilePatterns = @('*ActionPlan*', '*Action_Plan*', '*Action Plan*', '*Action-Plan*')
+    # Every Excel file (.xlsx/.xlsm) passed in is read as a remediation tracker
+    # and gets its own Remediation Status report (PDF + CSV). The sheet is
+    # picked automatically: one named like "Tracker" or "Action Plan" that has
+    # CVE IDs, otherwise the sheet with the most CVE IDs. A sheet named
+    # "...Completed" is used to mark items done when there is no Status column.
+    # Set RemediationSheetName to force a sheet, e.g. 'Vulnerability Tracker'.
+    RemediationSheetName = ''
+    # A .csv whose name matches one of these is also read as a tracker (once
+    # Owner/Status/Target Date/Notes is filled in).
+    RemediationFilePatterns = @('*ActionPlan*', '*Action_Plan*', '*Action Plan*', '*Action-Plan*', '*Tracker*')
 
     # ---- IP address -> host name (nslookup on the domain controllers) ----
     # IPs that arrive without a host name (Nessus, Blumira) are looked up as
@@ -94,6 +99,20 @@
     NvdDelaySeconds = @{
         WithKey    = 0.7
         WithoutKey = 6.5
+    }
+
+    # Throttling for CIRCL and MITRE CWE (and the retry rules for all APIs).
+    # On HTTP 429/503 the script waits (Retry-After if sent, else 10, 20, 40,
+    # 80, 120 s), doubles the gap for that site for the rest of the run, and
+    # carries on. Finished lookups are saved every SaveCacheEvery requests, so
+    # a run that is stopped picks up where it left off.
+    ApiThrottle = @{
+        CirclDelaySeconds = 1.0    # one CIRCL request per second (658 CVEs = about 11 min)
+        CweDelaySeconds   = 0.5
+        MaxRetries        = 6      # per request, on 429/503/5xx
+        MaxBackoffSeconds = 120
+        MaxDelaySeconds   = 10     # the gap never grows past this
+        SaveCacheEvery    = 25
     }
 
     # Report layout

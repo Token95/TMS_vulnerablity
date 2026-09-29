@@ -95,7 +95,7 @@ param(
 
 begin {
     $ErrorActionPreference = 'Stop'
-    $ScriptVersion = '3.6.0'
+    $ScriptVersion = '3.8.0'
     $ScriptRoot = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
     if (-not $OutputFolder) { $OutputFolder = Join-Path $ScriptRoot 'Reports' }
     if (-not $SettingsPath) { $SettingsPath = Join-Path $ScriptRoot 'settings.psd1' }
@@ -181,8 +181,10 @@ begin {
             CodeQLRepositoryName = ''
             CacheHours = @{ Kev = 24; Nvd = 168; Circl = 168; Cwe = 720 }
             NvdDelaySeconds = @{ WithKey = 0.7; WithoutKey = 6.5 }
+            ApiThrottle = @{ CirclDelaySeconds = 1.0; CweDelaySeconds = 0.5; MaxRetries = 6; MaxBackoffSeconds = 120; MaxDelaySeconds = 10; SaveCacheEvery = 25 }
             MaxHostsShownPerRow = 40
-            RemediationFilePatterns = @('*ActionPlan*', '*Action_Plan*', '*Action Plan*', '*Action-Plan*')
+            RemediationFilePatterns = @('*ActionPlan*', '*Action_Plan*', '*Action Plan*', '*Action-Plan*', '*Tracker*')
+            RemediationSheetName = ''
             ResolveIpsWithDns = $true
             DnsServers = @()
             DnsShortNames = $true
@@ -831,22 +833,89 @@ begin {
         return ((Get-Date) - $d).TotalHours -lt $Hours
     }
 
+    # ---- API pacing -----------------------------------------------------------
+    # Every request to a host waits until that host's minimum gap has passed.
+    # A 429 (Too Many Requests) or 503 makes the script wait (Retry-After if the
+    # server sends one, otherwise an increasing back-off) and slows that host
+    # down for the rest of the run instead of giving up.
+    $script:ApiGap = @{}        # host -> seconds between requests
+    $script:ApiLast = @{}       # host -> time of the last request
+    $script:ApiThrottled = @{}  # host -> $true once we've told the operator
+
+    function Set-ApiPace {
+        param([string]$Url, [double]$Seconds)
+        try { $h = ([Uri]$Url).Host } catch { return }
+        if ($h) { $script:ApiGap[$h] = [Math]::Max([double]0, [double]$Seconds) }
+    }
+
+    function Wait-ApiSlot {
+        param([string]$HostName)
+        $gap = if ($script:ApiGap.ContainsKey($HostName)) { [double]$script:ApiGap[$HostName] } else { 0.5 }
+        if ($script:ApiLast.ContainsKey($HostName)) {
+            $wait = $gap - ((Get-Date) - $script:ApiLast[$HostName]).TotalSeconds
+            if ($wait -gt 0) { Start-Sleep -Milliseconds ([int]($wait * 1000)) }
+        }
+        $script:ApiLast[$HostName] = Get-Date
+    }
+
+    function Get-RetryAfterSeconds {
+        # Reads Retry-After from the error response (Windows PowerShell 5.1 and PowerShell 7)
+        param($ErrorRecord)
+        $resp = $ErrorRecord.Exception.Response
+        if (-not $resp) { return $null }
+        $raw = $null
+        try { if ($resp.Headers.RetryAfter) { $ra = $resp.Headers.RetryAfter; if ($ra.Delta) { return [int]$ra.Delta.TotalSeconds }; if ($ra.Date) { return [int]($ra.Date.UtcDateTime - [DateTime]::UtcNow).TotalSeconds } } } catch { }
+        try { $raw = $resp.Headers['Retry-After'] } catch { }
+        if (-not $raw) { try { $raw = $resp.GetResponseHeader('Retry-After') } catch { } }
+        if (-not $raw) { return $null }
+        $n = 0
+        if ([int]::TryParse("$raw", [ref]$n)) { return $n }
+        $d = [DateTime]::MinValue
+        if ([DateTime]::TryParse("$raw", [ref]$d)) { return [int]($d.ToUniversalTime() - [DateTime]::UtcNow).TotalSeconds }
+        return $null
+    }
+
     function Invoke-Api {
-        param([string]$Uri, [hashtable]$Headers = @{}, [int]$TimeoutSec = 25, [int]$Retries = 1)
+        param([string]$Uri, [hashtable]$Headers = @{}, [int]$TimeoutSec = 25)
         # Windows PowerShell 5.1 rejects User-Agent inside -Headers, so use -UserAgent
         $ua = "TMS-VulnReport/$ScriptVersion (PowerShell)"
-        for ($i = 0; $i -le $Retries; $i++) {
+        $apiHost = ([Uri]$Uri).Host
+        $th = $script:ThrottleCfg
+        $maxRetries = if ($th -and $th.MaxRetries) { [int]$th.MaxRetries } else { 6 }
+        $maxWait = if ($th -and $th.MaxBackoffSeconds) { [int]$th.MaxBackoffSeconds } else { 120 }
+        $maxGap = if ($th -and $th.MaxDelaySeconds) { [double]$th.MaxDelaySeconds } else { 10 }
+        $netFails = 0
+        for ($i = 0; ; $i++) {
+            Wait-ApiSlot $apiHost
             try {
                 return Invoke-RestMethod -Uri $Uri -Headers $Headers -UserAgent $ua -TimeoutSec $TimeoutSec -UseBasicParsing -ErrorAction Stop
             } catch {
                 $code = $null
                 try { $code = [int]$_.Exception.Response.StatusCode } catch { }
                 if ($code -eq 404) { return $null }
-                if (-not $code -and $i -ge 1) { throw }          # network unreachable: one retry only
-                if (($code -in 403, 429, 500, 502, 503, 504 -or -not $code) -and $i -lt $Retries) {
-                    $wait = if ($code) { 6 * ($i + 1) } else { 2 }
-                    Write-Log 'WARN' "HTTP $code from $Uri - retrying in $wait s"
+                if (-not $code) {                               # network error / timeout: one retry
+                    $netFails++
+                    if ($netFails -ge 2) { throw }
+                    Start-Sleep -Seconds 3
+                    continue
+                }
+                if ($code -in 403, 429, 500, 502, 503, 504 -and $i -lt $maxRetries) {
+                    $wait = Get-RetryAfterSeconds $_
+                    if (-not $wait -or $wait -lt 1) { $wait = [Math]::Min([double]$maxWait, 10.0 * [Math]::Pow(2, $i)) }   # 10, 20, 40, 80, 120...
+                    $wait = [int][Math]::Min([double]$maxWait, [double]$wait)
+                    if ($code -in 403, 429, 503) {
+                        # Slow this host down for the rest of the run
+                        $cur = if ($script:ApiGap.ContainsKey($apiHost)) { [double]$script:ApiGap[$apiHost] } else { 0.5 }
+                        $script:ApiGap[$apiHost] = [Math]::Min($maxGap, [Math]::Max(1.0, $cur * 2))
+                        if (-not $script:ApiThrottled[$apiHost]) {
+                            $script:ApiThrottled[$apiHost] = $true
+                            Write-Host ''
+                            Write-Info ("{0} is rate-limiting (HTTP {1}). Waiting {2} s, then continuing at one request every {3:N1} s." -f $apiHost, $code, $wait, $script:ApiGap[$apiHost])
+                        }
+                    }
+                    Write-Log 'WARN' ("HTTP {0} from {1} - retry {2}/{3} in {4} s (gap now {5:N1} s)" -f $code, $Uri, ($i + 1), $maxRetries, $wait, $script:ApiGap[$apiHost])
                     Start-Sleep -Seconds $wait
+                    $script:ApiLast.Remove($apiHost)            # the back-off already covered the gap
                     continue
                 }
                 throw
@@ -1809,6 +1878,7 @@ a{color:var(--ink)}}
                                 'b' { if ($v -eq '1') { 'TRUE' } else { 'FALSE' } }
                                 default { $v }
                             }
+                            if ("$val".Contains('_x')) { $val = [regex]::Replace("$val", '_x([0-9A-Fa-f]{4})_', { param($m) [string][char][Convert]::ToInt32($m.Groups[1].Value, 16) }) }
                             $cells[$col] = "$val"
                             if ($col -gt $max) { $max = $col }
                         }
@@ -1817,7 +1887,7 @@ a{color:var(--ink)}}
                         $rows.Add($arr)
                     }
                 }
-                $sheets.Add([pscustomobject]@{ Name = $sh.GetAttribute('name'); Rows = $rows })
+                $sheets.Add([pscustomobject]@{ Name = $sh.GetAttribute('name'); Hidden = ($sh.GetAttribute('state') -in 'hidden', 'veryHidden'); Rows = $rows })
             }
             return $sheets.ToArray()
         } finally {
@@ -1853,46 +1923,80 @@ a{color:var(--ink)}}
         return ($leaf -match '(?i)^TMS_Vulnerability_Report_.*_(Findings|AllFindings)\.csv$' -or $leaf -match '(?i)^TMS_Remediation_Status_')
     }
 
+    function ConvertTo-SheetObjects {
+        # Turns sheet rows into objects keyed by the header row
+        param($Rows, [int]$HeaderAt)
+        $header = @($Rows[$HeaderAt])
+        $names = New-Object System.Collections.Generic.List[string]
+        for ($c = 0; $c -lt $header.Count; $c++) {
+            $n = ("$($header[$c])" -replace '\s+', ' ').Trim(); if (-not $n) { $n = "Column$($c + 1)" }
+            while ($names.Contains($n)) { $n = "$n~" }
+            $names.Add($n)
+        }
+        $objs = New-Object System.Collections.Generic.List[object]
+        for ($r = $HeaderAt + 1; $r -lt $Rows.Count; $r++) {
+            $cells = @($Rows[$r])
+            if (-not @($cells | Where-Object { "$_".Trim() }).Count) { continue }
+            $o = [ordered]@{}
+            for ($c = 0; $c -lt $names.Count; $c++) { $o[$names[$c]] = if ($c -lt $cells.Count) { "$($cells[$c])" } else { '' } }
+            $objs.Add([pscustomobject]$o)
+        }
+        return $objs.ToArray()
+    }
+
+    function Get-SheetCandidate {
+        # Finds the header row of a sheet and counts the rows that carry CVE IDs
+        param($Sheet)
+        $rows = $Sheet.Rows
+        $cveRx = '(?i)CVE-\d{4}-\d{4,}'
+        $headerAt = -1
+        for ($r = 0; $r -lt [Math]::Min(25, $rows.Count); $r++) {
+            $filled = @($rows[$r] | Where-Object { "$_".Trim() })
+            $cveHdr = @($filled | Where-Object { "$_" -match '(?i)\bcves?\b' -and "$_" -notmatch $cveRx -and "$_".Length -le 40 })
+            if ($cveHdr.Count -and $filled.Count -ge 3) { $headerAt = $r; break }
+        }
+        $cveRows = 0
+        for ($r = [Math]::Max(0, $headerAt + 1); $r -lt $rows.Count; $r++) { if ((@($rows[$r]) -join ' ') -match $cveRx) { $cveRows++ } }
+        if ($headerAt -lt 0 -and $cveRows) {
+            # No "CVE" header - use the first row with a few filled cells as the header
+            for ($r = 0; $r -lt $rows.Count; $r++) { if (@($rows[$r] | Where-Object { "$_".Trim() }).Count -ge 3) { $headerAt = $r; break } }
+        }
+        return [pscustomobject]@{ Sheet = $Sheet; HeaderAt = $headerAt; CveRows = $cveRows }
+    }
+
     function Read-RemediationRows {
-        # Returns @{ Sheet; Rows } where Rows are objects keyed by the header row
-        param([string]$File)
+        # Returns @{ Sheet; Rows; CompletedSheet; CompletedRows }
+        param([string]$File, $Cfg)
         $ext = [IO.Path]::GetExtension($File).ToLowerInvariant()
         if ($ext -eq '.csv') {
-            return [pscustomobject]@{ Sheet = ''; Rows = @(Import-Csv -LiteralPath $File) }
+            return [pscustomobject]@{ Sheet = ''; Rows = @(Import-Csv -LiteralPath $File); CompletedSheet = ''; CompletedRows = @() }
         }
         $sheets = @(Read-XlsxWorkbook $File)
-        $isCveHeader = { param($v) ("$v" -replace '[^A-Za-z]', '').ToLowerInvariant() -in 'cveid', 'cve', 'cveids' }
-        foreach ($sh in $sheets) {
-            $rows = $sh.Rows
-            $headerAt = -1
-            for ($r = 0; $r -lt [Math]::Min(25, $rows.Count); $r++) {
-                if (@($rows[$r] | Where-Object { & $isCveHeader $_ }).Count) { $headerAt = $r; break }
-            }
-            if ($headerAt -lt 0) {
-                # No "CVE ID" header - accept the sheet if CVE numbers appear in it anyway
-                $hasCve = $false
-                for ($r = 0; $r -lt [Math]::Min(200, $rows.Count); $r++) { if ((@($rows[$r]) -join ' ') -match '(?i)CVE-\d{4}-\d{4,}') { $hasCve = $true; break } }
-                if (-not $hasCve) { continue }
-                for ($r = 0; $r -lt $rows.Count; $r++) { if (@($rows[$r] | Where-Object { $_ }).Count -ge 2) { $headerAt = $r; break } }
-            }
-            $header = @($rows[$headerAt])
-            $names = New-Object System.Collections.Generic.List[string]
-            for ($c = 0; $c -lt $header.Count; $c++) {
-                $n = "$($header[$c])".Trim(); if (-not $n) { $n = "Column$($c + 1)" }
-                while ($names.Contains($n)) { $n = "$n~" }
-                $names.Add($n)
-            }
-            $objs = New-Object System.Collections.Generic.List[object]
-            for ($r = $headerAt + 1; $r -lt $rows.Count; $r++) {
-                $cells = @($rows[$r])
-                if (-not @($cells | Where-Object { "$_".Trim() }).Count) { continue }
-                $o = [ordered]@{}
-                for ($c = 0; $c -lt $names.Count; $c++) { $o[$names[$c]] = if ($c -lt $cells.Count) { "$($cells[$c])" } else { '' } }
-                $objs.Add([pscustomobject]$o)
-            }
-            return [pscustomobject]@{ Sheet = $sh.Name; Rows = $objs.ToArray() }
+        $cands = @($sheets | Where-Object { -not $_.Hidden } | ForEach-Object { Get-SheetCandidate $_ } | Where-Object { $_.HeaderAt -ge 0 -and $_.CveRows -gt 0 })
+        $doneRx = '(?i)complet|closed|done|resolved|archive'
+        $pick = $null
+        $forced = "$($Cfg.RemediationSheetName)".Trim()
+        if ($forced) {
+            $sh = @($sheets | Where-Object { $_.Name -ieq $forced })[0]
+            if (-not $sh) { throw "sheet '$forced' (RemediationSheetName in settings.psd1) is not in this workbook. Sheets: $((@($sheets | ForEach-Object { $_.Name })) -join ', ')" }
+            $pick = Get-SheetCandidate $sh
+            if ($pick.HeaderAt -lt 0) { $pick.HeaderAt = 0 }
+        } else {
+            $active = @($cands | Where-Object { $_.Sheet.Name -notmatch $doneRx })
+            if (-not $active.Count) { $active = $cands }
+            # A sheet named like a tracker or action plan wins; otherwise the one with the most CVE rows
+            $named = @($active | Where-Object { $_.Sheet.Name -match '(?i)tracker|action.?plan|remediation|vulnerab' } | Sort-Object CveRows -Descending)
+            $pick = if ($named.Count) { $named[0] } else { @($active | Sort-Object CveRows -Descending)[0] }
         }
-        return [pscustomobject]@{ Sheet = ''; Rows = @() }
+        if (-not $pick) { return [pscustomobject]@{ Sheet = ''; Rows = @(); CompletedSheet = ''; CompletedRows = @() } }
+        $rows = ConvertTo-SheetObjects $pick.Sheet.Rows $pick.HeaderAt
+        # A "Completed" sheet next to the tracker is used to mark rows done when the tracker has no status
+        $done = @($cands | Where-Object { $_.Sheet.Name -match $doneRx -and $_.Sheet.Name -ne $pick.Sheet.Name } | Sort-Object CveRows -Descending)[0]
+        $doneRows = if ($done) { ConvertTo-SheetObjects $done.Sheet.Rows $done.HeaderAt } else { @() }
+        return [pscustomobject]@{
+            Sheet = $pick.Sheet.Name; Rows = $rows
+            CompletedSheet = $(if ($done) { $done.Sheet.Name } else { '' }); CompletedRows = @($doneRows)
+        }
     }
 
     function Test-ActionPlanHasEntries {
@@ -1904,33 +2008,135 @@ a{color:var(--ink)}}
         return $false
     }
 
+    function Resolve-RemediationColumns {
+        # Matches the workbook's own column names to the fields the report needs.
+        # Each entry: field, patterns tried in order, patterns that rule a column out.
+        param([string[]]$Headers)
+        $spec = @(
+            ,@('Cve',        @('(?i)^cves?(\s*ids?)?$', '(?i)\bcves?\b'), @('(?i)count|date|score|cvss'))
+            ,@('Cwe',        @('(?i)^cwes?(\s*ids?)?$'), @())
+            ,@('CweName',    @('(?i)^cwe names?$'), @())
+            ,@('Severity',   @('(?i)^severity$', '(?i)severity', '(?i)^risk( rating| level)?$', '(?i)^sla tier$'), @())
+            ,@('Cvss',       @('(?i)^(max\s*)?cvss(\s*(base\s*)?score)?$', '(?i)cvss'), @('(?i)vector'))
+            ,@('Kev',        @('(?i)kev'), @('(?i)date|due|action'))
+            ,@('Identified', @('(?i)identified|discovered|detected|first seen|date found|date opened|date added|date reported'), @('(?i)\bby\b'))
+            ,@('Due',        @('(?i)^(sla )?due( date)?$', '(?i)sla due|due date'), @())
+            ,@('Target',     @('(?i)target|planned|^eta$|scheduled'), @())
+            ,@('Completed',  @('(?i)(date )?(completed|completion|remediated|closed|resolved)( date| on)?$'), @('(?i)status|\bby\b'))
+            ,@('Status',     @('(?i)^status$', '(?i)status|^state$|progress'), @('(?i)date'))
+            ,@('Owner',      @('(?i)^owner$', '(?i)owner|assigned|assignee|responsible|point of contact|^poc$|engineer|technician|resource|^lead$'), @('(?i)date'))
+            ,@('Hosts',      @('(?i)^affected hosts?$', '(?i)affected asset|^assets?(\(s\))?$|host|device|system|server|endpoint'), @('(?i)user|count|type'))
+            ,@('Users',      @('(?i)^affected users?$', '(?i)^users?$'), @())
+            ,@('Locations',  @('(?i)code location|^locations?$'), @())
+            ,@('Fix',        @('(?i)^(fix|remediation|solution|mitigation|action|recommended action|remediation (guidance|action|steps|plan))$', '(?i)solution|mitigation|recommend'), @('(?i)status|date|owner|target|due'))
+            ,@('Finding',    @('(?i)^(finding|title|vulnerability|vulnerability name|vulnerability title|name)$', '(?i)vulnerability name|finding|title', '(?i)vulnerab'), @('(?i)cve|\bid\b|count|date'))
+            ,@('Tenant',     @('(?i)tenant|enclave|environment'), @())
+            ,@('BusinessUnit', @('(?i)business unit|department|division'), @())
+            ,@('Source',     @('(?i)^source$|found by|scanner|^tool$'), @())
+            ,@('Notes',      @('(?i)notes?|comments?|updates?'), @('(?i)date|last'))
+            ,@('Priority',   @('(?i)^priority$', '(?i)^#$', '(?i)^id$'), @())
+        )
+        $used = New-Object 'System.Collections.Generic.HashSet[string]'
+        $cols = [ordered]@{}
+        foreach ($s in $spec) {
+            $found = $null
+            foreach ($p in $s[1]) {
+                foreach ($h in $Headers) {
+                    if ($used.Contains($h)) { continue }
+                    $k = "$h".Trim()
+                    if ($k -match '^Column\d+$') { continue }
+                    if ($k -match $p -and -not @($s[2] | Where-Object { $k -match $_ }).Count) { $found = $h; break }
+                }
+                if ($found) { break }
+            }
+            if ($found) { [void]$used.Add($found) }
+            $cols[$s[0]] = $found
+        }
+        return $cols
+    }
+
     function Get-RemediationItems {
-        param([object[]]$Rows, $Kev, [datetime]$Today)
+        param([object[]]$Rows, $Kev, [datetime]$Today, $Cfg, [object[]]$CompletedRows, [string]$CompletedSheet)
         if (-not $Rows.Count) { return @() }
-        $map = New-ColumnMap $Rows[0].PSObject.Properties.Name
+        $cols = Resolve-RemediationColumns @($Rows[0].PSObject.Properties.Name)
+        $script:RemediationColumns = $cols
+        $val = {
+            param($r, [string]$Field)
+            $h = $cols[$Field]
+            if (-not $h) { return '' }
+            $s = "$($r.$h)".Trim()
+            if ($s -match '(?i)^(n/?a|none|null|tbd|-+|\?)$') { return '' }
+            return $s
+        }
+        $split = { param($t) @("$t" -split '\s*[;,\r\n]+\s*' | ForEach-Object { $_.Trim() } | Where-Object { $_ -and $_ -notmatch '(?i)^(n/?a|none)$' }) }
+        $norm = { param($t) ("$t" -replace '[^A-Za-z0-9]', '').ToLowerInvariant() }
+
+        # Keys of rows listed on a "Completed" sheet (CVEs or name, plus tenant when there is one)
+        $doneKeys = New-Object 'System.Collections.Generic.HashSet[string]'
+        if ($CompletedRows -and @($CompletedRows).Count) {
+            $dc = Resolve-RemediationColumns @($CompletedRows[0].PSObject.Properties.Name)
+            foreach ($d in $CompletedRows) {
+                $dCves = @(Get-CveList "$(if ($dc.Cve) { $d.($dc.Cve) })") | Sort-Object
+                $dName = if ($dc.Finding) { & $norm $d.($dc.Finding) } else { '' }
+                $dTen = if ($dc.Tenant) { & $norm $d.($dc.Tenant) } else { '' }
+                if ($dCves.Count) { [void]$doneKeys.Add("cve:$($dCves -join ',')|$dTen") }
+                if ($dName) { [void]$doneKeys.Add("name:$dName|$dTen") }
+            }
+        }
+
         $items = New-Object System.Collections.Generic.List[object]
-        $split = { param($t) @("$t" -split '\s*[;\r\n]+\s*' | ForEach-Object { $_.Trim() } | Where-Object { $_ }) }
         foreach ($r in $Rows) {
-            $cveText = Get-Col $r $map 'cve id', 'cve', 'cve ids', 'vulnerabilities'
-            $cves = @(Get-CveList "$cveText $(Get-Col $r $map 'vulnerabilities', 'finding ids')")
-            $fix = Get-Col $r $map 'fix', 'remediation', 'remediation guidance'
-            $finding = Get-Col $r $map 'finding', 'title', 'vulnerability'
-            if (-not $cves.Count -and -not $fix -and -not $finding) { continue }
-            $sev = ConvertTo-SeverityWord (Get-Col $r $map 'severity', 'sla tier')
+            $cveText = & $val $r 'Cve'
+            $cves = @(Get-CveList $cveText)
+            $finding = & $val $r 'Finding'
+            $fix = & $val $r 'Fix'
+            if (-not $fix) { $fix = $finding; $finding = '' }          # trackers often name the fix in the vulnerability column
+            if (-not $cves.Count -and -not $fix) { continue }
+            $plugin = if (-not $cves.Count -and $cveText -and $cveText -notmatch '(?i)^n/?a$') { $cveText } else { '' }
+
+            $sev = ConvertTo-SeverityWord (& $val $r 'Severity')
+            $cvss = ConvertTo-ScoreOrNull (& $val $r 'Cvss')
+            if (-not $sev -and $null -ne $cvss) { $sev = Get-SeverityFromScore $cvss $Cfg.Thresholds }
             if (-not $sev) { $sev = 'Info' }
-            $due = ConvertFrom-ExcelDate (Get-Col $r $map 'due date', 'sla due date', 'due')
-            $target = ConvertFrom-ExcelDate (Get-Col $r $map 'target date', 'target', 'planned date')
-            $owner = Get-Col $r $map 'owner', 'assigned to', 'assignee'
-            $statusRaw = Get-Col $r $map 'status', 'remediation status', 'state'
+
+            $sheetKev = (& $val $r 'Kev') -match '(?i)^(yes|true|y|1)$'
+            $kevNow = @($cves | Where-Object { $Kev -and $Kev.ContainsKey($_) })
+            $isKev = ($sheetKev -or $kevNow.Count -gt 0)
+
+            $identified = ConvertFrom-ExcelDate (& $val $r 'Identified')
+            $due = ConvertFrom-ExcelDate (& $val $r 'Due')
+            $slaTier = if ($isKev -and $Cfg.KevEscalatesToCritical) { 'Critical' } else { $sev }
+            $dueFrom = 'sheet'
+            if (-not $due -and $identified -and $Cfg.RemediationSlaDays[$slaTier]) {
+                $due = $identified.AddDays([int]$Cfg.RemediationSlaDays[$slaTier])      # TMS SLA from the date identified
+                $dueFrom = 'sla'
+            }
+            $target = ConvertFrom-ExcelDate (& $val $r 'Target')
+            $completedOn = ConvertFrom-ExcelDate (& $val $r 'Completed')
+            $owner = & $val $r 'Owner'
+            $notes = & $val $r 'Notes'
+            $tenant = & $val $r 'Tenant'
+
+            $statusRaw = & $val $r 'Status'
             $status = switch -Regex ($statusRaw) {
                 '(?i)^(done|complete|completed|closed|fixed|remediated|resolved|patched|mitigated)' { 'Completed'; break }
                 '(?i)(accept|exception|waiv|defer)' { 'Risk accepted'; break }
                 '(?i)(progress|working|started|scheduled|pending|assigned)' { 'In progress'; break }
-                default { if ($statusRaw) { $statusRaw } else { 'Open' } }
+                default { if ($statusRaw) { $statusRaw } else { '' } }
             }
+            if (-not $status -and $completedOn) { $status = 'Completed' }
+            if (-not $status -and $doneKeys.Count) {
+                $ten = & $norm $tenant
+                $keyCve = "cve:$((@($cves) | Sort-Object) -join ',')|$ten"
+                $keyName = "name:$(& $norm $(if ($finding) { $finding } else { $fix }))|$ten"
+                if (($cves.Count -and $doneKeys.Contains($keyCve)) -or $doneKeys.Contains($keyName)) {
+                    $status = 'Completed'
+                    if (-not $notes) { $notes = "Listed on the '$CompletedSheet' sheet" }
+                }
+            }
+            if (-not $status) { $status = 'Open' }
             $isOpen = $status -notin 'Completed', 'Risk accepted'
-            $sheetKev = (Get-Col $r $map 'cisa kev') -match '(?i)^(yes|true|y|1)$'
-            $kevNow = @($cves | Where-Object { $Kev -and $Kev.ContainsKey($_) })
+
             $days = if ($due) { [int][Math]::Floor(($due - $Today).TotalDays) } else { $null }
             $issues = New-Object System.Collections.Generic.List[string]
             if ($isOpen) {
@@ -1938,32 +2144,37 @@ a{color:var(--ink)}}
                 if (-not $owner) { $issues.Add('No owner') }
                 if ($target -and $due -and $target -gt $due) { $issues.Add("Target date is $([int]($target - $due).TotalDays) days after the SLA due date") }
                 if ($target -and $target -lt $Today) { $issues.Add('Target date has passed') }
-                if ($kevNow.Count -and -not $sheetKev) { $issues.Add("Added to CISA KEV since this plan was made ($($kevNow -join ', ')) - hold to the Critical timeline") }
+                if ($kevNow.Count -and -not $sheetKev -and $sev -ne 'Critical') { $issues.Add("On CISA KEV ($($kevNow -join ', ')) - held to the Critical timeline") }
             }
-            $cwes = @(Get-CweList (Get-Col $r $map 'cwe', 'cwes', 'cwe id'))
             $items.Add([pscustomobject][ordered]@{
-                Priority = Get-Col $r $map 'priority', '#'
+                Priority = & $val $r 'Priority'
                 Cves = $cves
-                Cwes = $cwes
-                CweNames = Get-Col $r $map 'cwe name', 'cwe names'
+                PluginId = $plugin
+                Cwes = @(Get-CweList (& $val $r 'Cwe'))
+                CweNames = & $val $r 'CweName'
                 Fix = $fix
                 Finding = $finding
                 Severity = $sev
                 SeverityRank = Get-SeverityRank $sev
-                Cvss = ConvertTo-ScoreOrNull (Get-Col $r $map 'max cvss', 'cvss', 'cvss score')
-                IsKev = ($sheetKev -or $kevNow.Count -gt 0)
-                Hosts = & $split (Get-Col $r $map 'affected hosts', 'hosts', 'host')
-                Users = & $split (Get-Col $r $map 'affected users', 'users', 'user')
-                Locations = & $split (Get-Col $r $map 'code locations', 'locations')
-                Sources = Get-Col $r $map 'found by', 'source'
+                Cvss = $cvss
+                IsKev = $isKev
+                Tenant = $tenant
+                BusinessUnit = & $val $r 'BusinessUnit'
+                Hosts = & $split (& $val $r 'Hosts')
+                Users = & $split (& $val $r 'Users')
+                Locations = & $split (& $val $r 'Locations')
+                Sources = & $val $r 'Source'
                 Owner = $owner
                 Status = $status
                 IsOpen = $isOpen
+                IdentifiedDate = $identified
                 DueDate = $due
+                DueFrom = $dueFrom
                 DaysRemaining = $days
                 SlaStatus = if (-not $isOpen) { $status } elseif (-not $due) { 'No SLA' } elseif ($days -lt 0) { 'Overdue' } elseif ($days -le 14) { 'Due soon' } else { 'On track' }
                 TargetDate = $target
-                Notes = Get-Col $r $map 'notes', 'comments', 'comment'
+                CompletedDate = $completedOn
+                Notes = $notes
                 Issues = $issues.ToArray()
             })
         }
@@ -2030,7 +2241,13 @@ a{color:var(--ink)}}
 
         $cveCell = {
             param($it)
-            if (@($it.Cves).Count) { return (@($it.Cves) | Select-Object -First 6 | ForEach-Object { "<span class=""vid"">$(Get-VulnLink $_)</span>" }) -join '<br>' }
+            $c = @($it.Cves)
+            if ($c.Count) {
+                $h = (@($c | Select-Object -First 6 | ForEach-Object { "<span class=""vid"">$(Get-VulnLink $_)</span>" })) -join '<br>'
+                if ($c.Count -gt 6) { $h += "<br><span class=""muted"">+ $($c.Count - 6) more</span>" }
+                return $h
+            }
+            if ($it.PluginId) { return "<span class=""vid"">$(& $e $it.PluginId)</span>" }
             return '<span class="muted">No CVE</span>'
         }
         $statusCell = {
@@ -2082,8 +2299,9 @@ a{color:var(--ink)}}
         $order = $Items | Sort-Object @{ e = { if ($_.IsOpen) { 0 } elseif ($_.Status -eq 'Risk accepted') { 1 } else { 2 } } },
                                       @{ e = { if ($_.DueDate) { $_.DueDate } else { [datetime]::MaxValue } } }, @{ e = { $_.SeverityRank }; Descending = $true }
         foreach ($it in $order) {
+            $tenantTag = if ($it.Tenant) { '<div class="assets"><span class="asset-label">Tenant</span> ' + (& $e $it.Tenant) + '</div>' } else { '' }
             $kevTag = if ($it.IsKev) { '<br><span class="kev">CISA KEV</span>' } else { '' }
-            & $w "<tr><td>$(& $cveCell $it)</td><td>$(Get-CweCell $it)</td><td class=""fix"">$(& $fixCell $it)</td><td>$(Get-SevPill $it.Severity $it.Cvss)$kevTag</td><td>$(Get-AssetCell $it $Cfg.MaxHostsShownPerRow)</td><td>$(& $statusCell $it)</td><td>$(& $dueCell $it)</td><td>$(& $targetCell $it)</td></tr>"
+            & $w "<tr><td>$(& $cveCell $it)</td><td>$(Get-CweCell $it)</td><td class=""fix"">$(& $fixCell $it)</td><td>$(Get-SevPill $it.Severity $it.Cvss)$kevTag</td><td>$tenantTag$(Get-AssetCell $it $Cfg.MaxHostsShownPerRow)</td><td>$(& $statusCell $it)</td><td>$(& $dueCell $it)</td><td>$(& $targetCell $it)</td></tr>"
         }
         & $w '</tbody></table></div></section>'
 
@@ -2097,15 +2315,25 @@ a{color:var(--ink)}}
         # One Remediation Status report (PDF + CSV) per Action Plan workbook
         param([string]$File, $Cfg, $Kev, [string]$OutputFolder, [datetime]$ReportDate, [int]$Index, [int]$Total)
         $leaf = Split-Path $File -Leaf
-        $read = Read-RemediationRows $File
+        $read = Read-RemediationRows $File $Cfg
         if (-not @($read.Rows).Count) {
-            Write-Bad "$leaf - no sheet with CVE IDs was found. Skipped."
+            Write-Info "$leaf - no sheet with CVE IDs, so not a remediation workbook. Skipped."
             return $null
         }
-        $items = @(Get-RemediationItems @($read.Rows) $Kev $ReportDate.Date)
+        $items = @(Get-RemediationItems -Rows @($read.Rows) -Kev $Kev -Today $ReportDate.Date -Cfg $Cfg -CompletedRows @($read.CompletedRows) -CompletedSheet $read.CompletedSheet)
         if (-not $items.Count) { Write-Bad "$leaf - the sheet has no remediation rows. Skipped."; return $null }
         $sheetLabel = if ($read.Sheet) { " (sheet '$($read.Sheet)')" } else { '' }
         Write-Good "$leaf$sheetLabel - remediation workbook, $($items.Count) item(s)."
+        # Show which columns were used, so a wrong match is easy to spot
+        $cols = $script:RemediationColumns
+        $shown = @('Cve', 'Finding', 'Fix', 'Hosts', 'Severity', 'Cvss', 'Identified', 'Due', 'Target', 'Owner', 'Status', 'Completed', 'Notes', 'Tenant') | Where-Object { $cols[$_] } | ForEach-Object { "$_ = '$($cols[$_])'" }
+        Write-Info ("    Columns: " + ($shown -join ', '))
+        $missing = @('Owner', 'Status') | Where-Object { -not $cols[$_] }
+        if ($missing.Count) { Write-Info "    No $($missing -join ' or ') column found$(if ('Status' -in $missing) { '; items count as open unless a completed date or the Completed sheet says otherwise' })." }
+        $calc = @($items | Where-Object { $_.DueFrom -eq 'sla' }).Count
+        if ($calc) { Write-Info "    SLA due date worked out from the date identified for $calc item(s) (Critical $($Cfg.RemediationSlaDays.Critical) / High $($Cfg.RemediationSlaDays.High) / Medium $($Cfg.RemediationSlaDays.Medium) / Low $($Cfg.RemediationSlaDays.Low) days)." }
+        $fromDone = @($items | Where-Object { $_.Notes -like "Listed on the '*' sheet" }).Count
+        if ($fromDone) { Write-Info "    $fromDone item(s) marked completed from the '$($read.CompletedSheet)' sheet." }
 
         $stamp = $ReportDate.ToString('yyyy-MM') + '_' + (Get-Date -Format 'yyyyMMdd-HHmm')
         $tag = ''
@@ -2123,12 +2351,13 @@ a{color:var(--ink)}}
             [pscustomobject][ordered]@{
                 'CVE ID' = $(if (@($_.Cves).Count) { & $join $_.Cves } else { 'No CVE' })
                 'CWE' = $(if (@($_.Cwes).Count) { & $join $_.Cwes } else { 'None listed' }); 'CWE Name' = $_.CweNames
-                'Priority' = $_.Priority; 'Fix' = $_.Fix; 'Finding' = $_.Finding; 'Severity' = $_.Severity
+                'Plugin ID' = $_.PluginId; 'Tenant' = $_.Tenant; 'Business Unit' = $_.BusinessUnit
+                'Priority' = $_.Priority; 'Fix' = $_.Fix; 'Finding' = $_.Finding; 'Severity' = $_.Severity; 'CVSS' = $_.Cvss
                 'CISA KEV' = $(if ($_.IsKev) { 'Yes' } else { 'No' })
                 'Affected Hosts' = & $join $_.Hosts; 'Affected Users' = & $join $_.Users; 'Code Locations' = & $join $_.Locations
                 'Owner' = $_.Owner; 'Status' = $_.Status
-                'SLA Due Date' = & $fmtDate $_.DueDate; 'Days Remaining' = $(if ($_.IsOpen) { $_.DaysRemaining } else { '' }); 'SLA Status' = $_.SlaStatus
-                'Target Date' = & $fmtDate $_.TargetDate
+                'Date Identified' = & $fmtDate $_.IdentifiedDate; 'SLA Due Date' = & $fmtDate $_.DueDate; 'Days Remaining' = $(if ($_.IsOpen) { $_.DaysRemaining } else { '' }); 'SLA Status' = $_.SlaStatus
+                'Target Date' = & $fmtDate $_.TargetDate; 'Completed Date' = & $fmtDate $_.CompletedDate
                 'Issues' = & $join $_.Issues; 'Notes' = $_.Notes
             }
         } | Export-Csv -LiteralPath "$outBase.csv" -NoTypeInformation -Encoding UTF8
@@ -2179,6 +2408,7 @@ end {
         $leaf = Split-Path $f -Leaf
         $ext = [IO.Path]::GetExtension($f).ToLowerInvariant()
         if (Test-IsReportOutput $f) { Write-Info "$leaf - output from an earlier run, skipped (reading it back would double-count)."; continue }
+        if ($leaf.StartsWith('~$')) { continue }
         if (Test-RemediationFileName $f $cfg) {
             if ($ext -eq '.csv') {
                 $apRows = @()
@@ -2189,12 +2419,14 @@ end {
             continue
         }
         if ($ext -in '.xlsx', '.xlsm') {
-            Write-Bad "$leaf - Excel files are read only as Action Plan workbooks (the name must contain 'ActionPlan'; see RemediationFilePatterns in settings.psd1). Skipped."
+            # Any workbook is read as a remediation tracker; one with no CVE sheet is skipped later
+            if ($leaf.StartsWith('~$')) { continue }     # Excel's lock file while the workbook is open
+            $remFiles.Add($f)
             continue
         }
         $scanFiles.Add($f)
     }
-    Write-Good ("{0} scanner export(s) and {1} Action Plan workbook(s) queued." -f $scanFiles.Count, $remFiles.Count)
+    Write-Good ("{0} scanner export(s) and {1} remediation workbook(s) queued." -f $scanFiles.Count, $remFiles.Count)
 
     # ---- 1c. Remediation-only reports (no scanner parsing, no NVD/CIRCL/CWE calls) ----
     $remResults = New-Object System.Collections.Generic.List[object]
@@ -2292,10 +2524,14 @@ end {
     $nvdFile = Join-Path $cacheDir 'nvd_cache.json';     $nvdCache = Read-JsonCache $nvdFile
     $circlFile = Join-Path $cacheDir 'circl_cache.json'; $circlCache = Read-JsonCache $circlFile
     $cweFile = Join-Path $cacheDir 'cwe_cache.json';     $cweCache = Read-JsonCache $cweFile
+    $script:ThrottleCfg = $cfg.ApiThrottle
+    $saveEvery = [Math]::Max(1, [int]$cfg.ApiThrottle.SaveCacheEvery)
+    Set-ApiPace $cfg.Api.CweUrl ([double]$cfg.ApiThrottle.CweDelaySeconds)
 
     if (-not $Offline -and -not $SkipNvd -and $cves.Count) {
         $todo = @($cves | Where-Object { -not (Test-CacheFresh $nvdCache[$_] $cfg.CacheHours.Nvd) })
         $delay = if ($apiKey) { [double]$cfg.NvdDelaySeconds.WithKey } else { [double]$cfg.NvdDelaySeconds.WithoutKey }
+        Set-ApiPace $cfg.Api.NvdUrl $delay
         if ($todo.Count) {
             Write-Info ("Querying NIST NVD for {0} CVE(s) ({1}; about {2:N0} s)." -f $todo.Count, $(if ($apiKey) { 'API key in use' } else { 'no API key - set TMS_NVD_API_KEY to go faster' }), ($todo.Count * $delay))
         }
@@ -2304,8 +2540,8 @@ end {
             $i++
             Write-Progress -Activity 'NIST NVD' -Status $c -PercentComplete ($i * 100 / $todo.Count)
             try { $nvdCache[$c] = Get-NvdRecord $c $cfg $apiKey; $fail = 0 }
-            catch { $fail++; Write-Log 'WARN' "NVD lookup failed for $c : $($_.Exception.Message)"; if ($fail -ge 2) { Write-Bad "NVD is not responding ($($_.Exception.Message)) - using scanner scores for the rest."; break } }
-            Start-Sleep -Milliseconds ([int]($delay * 1000))
+            catch { $fail++; Write-Log 'WARN' "NVD lookup failed for $c : $($_.Exception.Message)"; if ($fail -ge 3) { Write-Bad "NVD is not responding ($($_.Exception.Message)) - using scanner scores for the rest. Run again later; finished lookups are cached."; break } }
+            if ($i % $saveEvery -eq 0) { Save-JsonCache $nvdCache $nvdFile }     # a stopped run picks up where it left off
         }
         Write-Progress -Activity 'NIST NVD' -Completed
         Save-JsonCache $nvdCache $nvdFile
@@ -2313,14 +2549,19 @@ end {
 
     if (-not $Offline -and -not $SkipCircl -and $cves.Count) {
         $todo = @($cves | Where-Object { -not (Test-CacheFresh $circlCache[$_] $cfg.CacheHours.Circl) })
-        if ($todo.Count) { Write-Info "Querying CIRCL for $($todo.Count) CVE(s) (vendor fixes and CISA SSVC data)." }
+        Set-ApiPace $cfg.Api.CirclUrl ([double]$cfg.ApiThrottle.CirclDelaySeconds)
+        if ($todo.Count) {
+            $secs = $todo.Count * [double]$cfg.ApiThrottle.CirclDelaySeconds
+            $eta = if ($secs -ge 120) { '{0:N0} min' -f ($secs / 60) } else { '{0:N0} s' -f $secs }
+            Write-Info ("Querying CIRCL for {0} CVE(s) (vendor fixes and CISA SSVC data; about {1} at one request every {2:N1} s)." -f $todo.Count, $eta, [double]$cfg.ApiThrottle.CirclDelaySeconds)
+        }
         $i = 0; $fail = 0
         foreach ($c in $todo) {
             $i++
             Write-Progress -Activity 'CIRCL CVE' -Status $c -PercentComplete ($i * 100 / $todo.Count)
             try { $circlCache[$c] = Get-CirclRecord $c $cfg; $fail = 0 }
-            catch { $fail++; Write-Log 'WARN' "CIRCL lookup failed for $c : $($_.Exception.Message)"; if ($fail -ge 2) { Write-Bad "CIRCL is not responding ($($_.Exception.Message)) - skipping the remaining CIRCL lookups."; break } }
-            Start-Sleep -Milliseconds 250
+            catch { $fail++; Write-Log 'WARN' "CIRCL lookup failed for $c : $($_.Exception.Message)"; if ($fail -ge 3) { Write-Bad "CIRCL is not responding ($($_.Exception.Message)) - skipping the remaining $($todo.Count - $i) CIRCL lookup(s). Run again later; finished lookups are cached."; break } }
+            if ($i % $saveEvery -eq 0) { Save-JsonCache $circlCache $circlFile }
         }
         Write-Progress -Activity 'CIRCL CVE' -Completed
         Save-JsonCache $circlCache $circlFile
